@@ -5,9 +5,9 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 # TODO:
-#   add support for xoffset, yoffset and flipping of x and y
-#
-#
+#   Add support for xoffset, yoffset and flipping of x and y
+#   Fix so that homing uses linear stepper movements, Use a fake cartesian kinematics
+#   Check other angle limits? such as head angle and angles by the body
 #
 
 
@@ -57,6 +57,7 @@ class FiveBarElbow:
         self.max_z_accel = config.getfloat(
             'max_z_accel', max_accel, above=0., maxval=max_accel)
         self.limit_z = (1.0, -1.0)
+        self.homedXY = False
 
         logging.info("5-Bar elbow driven %.2f %.2f %.2f %.2f %.2f",
                      self.left_inner_arm, self.left_outer_arm, 
@@ -66,10 +67,21 @@ class FiveBarElbow:
     def get_steppers(self):
         return [s for rail in self.rails for s in rail.get_steppers()]
 
+    def _distance(self, x0, y0, x1, y1):
+        dx = x1-x0
+        dy = y1-y0
+        return math.sqrt(dx*dx + dy*dy)
+
     def _triangle_side(self, a, b, C):
         return math.sqrt((a*a) + (b*b) - (2*a*b*math.cos(C)))
 
-    def angles_to_position(self, left_angle, right_angle):
+    # Find the angle of the corner opposite to side c
+    def _triangle_angle(self, a, b, c):
+        # cosine rule
+        cosC = (a*a + b*b - c*c) / ( 2*a*b)
+        return math.acos(cosC)
+
+    def _angles_to_position(self, left_angle, right_angle):
         # distance from attachement point to head
         left_d  = self._triangle_side(self.left_inner_arm,  self.left_outer_arm,  left_angle)
         right_d = self._triangle_side(self.right_inner_arm, self.right_outer_arm, right_angle)
@@ -78,13 +90,24 @@ class FiveBarElbow:
         x = dx - self.inner_distance / 2
         y = math.sqrt((left_d*left_d) - (dx*dx))
         return [x,y]
-        
+
+    def _position_distances(self, x, y):
+        left_d  = self._distance(-self.inner_distance/2,0, x, y)
+        right_d = self._distance(self.inner_distance/2,0, x, y)
+        return [left_d, right_d]
+
+    def _position_to_angles(self, x, y):
+        left_d, right_d  = self._position_distances(x, y)
+        left_a  = self._triangle_angle(self.left_inner_arm, self.left_outer_arm, left_d)
+        right_a  = self._triangle_angle(self.right_inner_arm, self.right_outer_arm, right_d)
+        return [left_a, right_a, left_d, right_d]
+
     def calc_tag_position(self):
         # Motor pos -> caretesian coordinates
         left_angle  = self.rails[0].get_tag_position()
         right_angle = self.rails[1].get_tag_position()
         z_pos       = self.rails[2].get_tag_position()
-        [x, y] = self.angles_to_position(left_angle, right_angle)
+        [x, y] = self._angles_to_position(left_angle, right_angle)
         #logging.info("5be calc_tag (%.2f, %.2f) -> (%.2f, %.2f, %.2f)", left_angle, right_angle, x, y, z_pos)
         return [x, y, z_pos]
     
@@ -92,6 +115,8 @@ class FiveBarElbow:
         #logging.info("5be set_position")
         for i, rail in enumerate(self.rails):
             rail.set_position(newpos)
+        if 0 in homing_axes and 1 in homing_axes:
+            self.homedXY = True
         if 2 in homing_axes:
             self.limit_z = self.rails[2].get_range()
             logging.info("Set z limit %f %f", self.limit_z[0], self.limit_z[1])
@@ -104,15 +129,17 @@ class FiveBarElbow:
         if 0 in axes or 1 in axes: #  XY
             # Home left and right at the same time
             # klipper does homing with cartesian moves which is less than ideal
-            #   One solution is to add endstop support to force_move and do the bulk of the moves with that
             #
             # Kevin21: On further thought, I think it should be possible to move all the steppers from the main toolhead motion queue (trapq) to a custom trapq
             #          during homing.  Then drip_move() could be moved from toolhead.py to homing.py.
             #          Then, it should be possible to swap in custom stepper_kinematics for steppers that need that.
-            #          That might be a general improvement, as then we wouldn't have to worry about normal homing moves going through the kinematic check_moves()  
+            #          That might be a general improvement, as then we wouldn't have to worry about normal homing moves going through the kinematic check_moves()
+            #
+            # TODO: Swap over to a cartesian kinematics while homing to get linear stepper movements
+            #
             homing_state.set_axes([0, 1])
             rails = [self.rails[0], self.rails[1]]
-            [x,y] = self.angles_to_position(rails[0].get_homing_info().position_endstop, rails[1].get_homing_info().position_endstop)
+            [x,y] = self._angles_to_position(rails[0].get_homing_info().position_endstop, rails[1].get_homing_info().position_endstop)
 
             # Swap to linear kinematics
             # old_kin = stepper.set_kinematics(my_cartesian_sk)
@@ -124,10 +151,11 @@ class FiveBarElbow:
                 forcepos = [x, y, None, None]
             logging.info("5be home XY %s %s %s", rails, forcepos, homepos);
 
-            # Swap to linear kinematics
             homing_state.home_rails(rails, forcepos, homepos)
             logging.info("Homed XY")
+            self.homedXY = True
 
+            # Swap backto real kinematics, compute new real X Y and set it
             # new_pos = stepper.get_commanded_position() ; stepper.set_kinematics(old_kin) ; stepper.set_commanded_position(new_pos)
             # try: ...  except: stepper.set_kinematics(old_kin)
             
@@ -151,8 +179,35 @@ class FiveBarElbow:
 
     def check_move(self, move):
         end_pos = move.end_pos
-        xpos, ypos = end_pos[:2]
-        # TODO check x, y
+
+        # XY moves
+        if move.axes_d[0] or move.axes_d[1]:
+            xpos, ypos = end_pos[:2]
+            logging.info("check_move %.2f %.2f", xpos, ypos)
+
+            if not self.homedXY:
+                raise move.move_error("Must home axis first")
+
+            # Check that coordinate is in front
+            if ypos < 0:
+                raise move.move_error("Attempted move behind printer")
+
+            # Make sure distance from left and right attachement point is no further away that inner+outer
+            [left_d, right_d] = self._position_distances(xpos, ypos)
+            if left_d > self.left_inner_arm+self.left_outer_arm or right_d > self.right_inner_arm+self.right_outer_arm:
+                raise move.move_error("Attempted move outside reachable area (arm length)")
+
+            # Check elbow angle limits
+            [left_a, right_a, left_d, right_d] = self._position_to_angles(xpos, ypos)
+            left_min_a, left_max_a = self.rails[0].get_range()
+            if left_a < left_min_a or left_a > left_max_a:
+                raise move.move_error("Attempted move left arm outside angle limits")
+
+            right_min_a, right_max_a = self.rails[1].get_range()
+            if right_a < right_min_a or right_a > right_max_a:
+                raise move.move_error("Attempted move right arm outside angle limits")
+
+            # TODO: Speed limits
 
         # Check Z
         if move.axes_d[2]:
