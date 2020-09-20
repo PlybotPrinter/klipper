@@ -16,7 +16,7 @@ struct fivebarelbow_stepper {
     struct stepper_kinematics sk;
     double inner_arm_length;
     double outer_arm_length;
-    double x_offset;
+    double inner_arm_offset;
 };
 
 static inline double sqr(double a) { return a*a; };
@@ -40,6 +40,8 @@ static inline double triangle_angle(double a, double b, double c)
     return acos(cosC);
 }
 
+
+// Each arm is computed separately
 static double
 fivebarelbow_stepper_calc_position(struct stepper_kinematics *sk, struct move *m,
                                    double move_time)
@@ -47,7 +49,7 @@ fivebarelbow_stepper_calc_position(struct stepper_kinematics *sk, struct move *m
     struct fivebarelbow_stepper *fs = container_of(sk, struct fivebarelbow_stepper, sk);
     struct coord c = move_get_coord(m, move_time);
     
-    double d = distance(fs->x_offset, 0, c.x, c.y);
+    double d = distance(fs->inner_arm_offset, 0, c.x, c.y);
     double angle = triangle_angle(fs->inner_arm_length,
                                   fs->outer_arm_length,
                                   d);    
@@ -69,9 +71,9 @@ fivebarelbow_stepper_alloc(char arm,
     fs->inner_arm_length = inner_arm_length;
     fs->outer_arm_length = outer_arm_length;
     if (arm == 'l') {
-        fs->x_offset = -inner_arms_distance / 2.0;
+        fs->inner_arm_offset = -inner_arms_distance / 2.0;
     } else if (arm == 'r') {
-        fs->x_offset = inner_arms_distance / 2.0;
+        fs->inner_arm_offset = inner_arms_distance / 2.0;
     }
     fs->sk.active_flags = AF_X | AF_Y;
     return &fs->sk;
