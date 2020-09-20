@@ -59,6 +59,14 @@ class FiveBarElbow:
         self.limit_z = (1.0, -1.0)
         self.homedXY = False
 
+        # Homing trickery fake cartesial kinematic to get linear stepper movement
+        self.printer = config.get_printer()
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.cartesian_kinematics_L = ffi_main.gc(
+            ffi_lib.cartesian_stepper_alloc('x'), ffi_lib.free)
+        self.cartesian_kinematics_R = ffi_main.gc(
+            ffi_lib.cartesian_stepper_alloc('y'), ffi_lib.free)
+
         logging.info("5-Bar elbow driven %.2f %.2f %.2f %.2f %.2f",
                      self.left_inner_arm, self.left_outer_arm, 
                      self.right_inner_arm, self.right_outer_arm,
@@ -66,6 +74,9 @@ class FiveBarElbow:
         
     def get_steppers(self):
         return [s for rail in self.rails for s in rail.get_steppers()]
+
+    def get_arm_steppers(self):
+        return [s for rail in self.rails[:2] for s in rail.get_steppers()]
 
     def _distance(self, x0, y0, x1, y1):
         dx = x1-x0
@@ -107,19 +118,22 @@ class FiveBarElbow:
         left_angle  = self.rails[0].get_tag_position()
         right_angle = self.rails[1].get_tag_position()
         z_pos       = self.rails[2].get_tag_position()
+        #logging.info("5be calc_tag (%.2f, %.2f) -> ...", left_angle, right_angle)
         [x, y] = self._angles_to_position(left_angle, right_angle)
         #logging.info("5be calc_tag (%.2f, %.2f) -> (%.2f, %.2f, %.2f)", left_angle, right_angle, x, y, z_pos)
         return [x, y, z_pos]
     
     def set_position(self, newpos, homing_axes):
-        #logging.info("5be set_position")
+        logging.info("5be set_position %s    %s", newpos, homing_axes)
         for i, rail in enumerate(self.rails):
             rail.set_position(newpos)
         if 0 in homing_axes and 1 in homing_axes:
             self.homedXY = True
+            logging.info("Set xy %f %f", newpos[0], newpos[1])
         if 2 in homing_axes:
             self.limit_z = self.rails[2].get_range()
             logging.info("Set z limit %f %f", self.limit_z[0], self.limit_z[1])
+
     def note_z_not_homed(self):
         # Helper for Safe Z Home
         self.limit_z = (1.0, -1.0)
@@ -128,38 +142,51 @@ class FiveBarElbow:
         logging.info("5be home %s", axes)
         if 0 in axes or 1 in axes: #  XY
             # Home left and right at the same time
-            # klipper does homing with cartesian moves which is less than ideal
-            #
-            # Kevin21: On further thought, I think it should be possible to move all the steppers from the main toolhead motion queue (trapq) to a custom trapq
-            #          during homing.  Then drip_move() could be moved from toolhead.py to homing.py.
-            #          Then, it should be possible to swap in custom stepper_kinematics for steppers that need that.
-            #          That might be a general improvement, as then we wouldn't have to worry about normal homing moves going through the kinematic check_moves()
-            #
-            # TODO: Swap over to a cartesian kinematics while homing to get linear stepper movements
-            #
+            self.homedXY = False
             homing_state.set_axes([0, 1])
             rails = [self.rails[0], self.rails[1]]
-            [x,y] = self._angles_to_position(rails[0].get_homing_info().position_endstop, rails[1].get_homing_info().position_endstop)
+            l_endstop = rails[0].get_homing_info().position_endstop
+            l_min, l_max = rails[0].get_range()
+
+            r_endstop = rails[1].get_homing_info().position_endstop
+            r_min, r_max = rails[1].get_range()
 
             # Swap to linear kinematics
-            # old_kin = stepper.set_kinematics(my_cartesian_sk)
-            homepos  = [x, y, None, None]
-            hil = rails[0].get_homing_info()
-            if hil.positive_dir:
-                forcepos = [0, 0, None, None]
-            else:
-                forcepos = [x, y, None, None]
-            logging.info("5be home XY %s %s %s", rails, forcepos, homepos);
-
-            homing_state.home_rails(rails, forcepos, homepos)
-            logging.info("Homed XY")
-            self.homedXY = True
-
-            # Swap backto real kinematics, compute new real X Y and set it
-            # new_pos = stepper.get_commanded_position() ; stepper.set_kinematics(old_kin) ; stepper.set_commanded_position(new_pos)
-            # try: ...  except: stepper.set_kinematics(old_kin)
+            toolhead = self.printer.lookup_object('toolhead')
+            toolhead.flush_step_generation()
             
+            steppers = self.get_arm_steppers()
+            kinematics = [self.cartesian_kinematics_L, self.cartesian_kinematics_R]
+            prev_sks    = [stepper.set_stepper_kinematics(kinematic) for stepper, kinematic in zip(steppers, kinematics)]
+
+            try:
+                homepos  = [l_endstop, r_endstop, None, None]
+                hil = rails[0].get_homing_info()
+                if hil.positive_dir:
+                    forcepos = [0, 0, None, None]
+                else:
+                    forcepos = [l_max, r_max, None, None]
+                logging.info("5be home LR %s %s %s", rails, forcepos, homepos);
+
+                homing_state.home_rails(rails, forcepos, homepos)
+
+                for stepper, prev_sk in zip(steppers, prev_sks):
+                    stepper.set_stepper_kinematics(prev_sk)
+
+                [x,y] = self._angles_to_position(rails[0].get_homing_info().position_endstop, rails[1].get_homing_info().position_endstop)
+                toolhead.set_position( [x, y, 0, 0], (0, 1))
+                toolhead.flush_step_generation()
+                #self.homedXY = True
+                logging.info("Homed LR done")
+
+            except Exception as e:
+                for stepper, prev_sk in zip(steppers, prev_sks):
+                    stepper.set_stepper_kinematics(prev_sk)
+                raise
+
+        logging.info("5be homeZ %s", axes)
         if 2 in axes: # Z
+            logging.info("5be home Z %s", axes)
             rail = self.rails[2]
             position_min, position_max = rail.get_range()
             hi = rail.get_homing_info()
@@ -175,6 +202,7 @@ class FiveBarElbow:
             homing_state.home_rails([rail], forcepos, homepos)
             
     def _motor_off(self, print_time):
+        self.homedXY = False
         self.limit_z = (1.0, -1.0)
 
     def check_move(self, move):
@@ -183,7 +211,6 @@ class FiveBarElbow:
         # XY moves
         if move.axes_d[0] or move.axes_d[1]:
             xpos, ypos = end_pos[:2]
-            logging.info("check_move %.2f %.2f", xpos, ypos)
 
             if not self.homedXY:
                 raise move.move_error("Must home axis first")
@@ -199,8 +226,10 @@ class FiveBarElbow:
 
             # Check elbow angle limits
             [left_a, right_a, left_d, right_d] = self._position_to_angles(xpos, ypos)
+            logging.info("check XY %.8f, %.8f  LR a %.8f, %.8f  LR d %.2f, %.2f   ", xpos, ypos, left_a, right_a, left_d, right_d)
             left_min_a, left_max_a = self.rails[0].get_range()
             if left_a < left_min_a or left_a > left_max_a:
+                logging.info("left failed check %.12f < %.12f < %.12f    ", left_min_a, left_a, left_max_a)
                 raise move.move_error("Attempted move left arm outside angle limits")
 
             right_min_a, right_max_a = self.rails[1].get_range()
@@ -215,14 +244,14 @@ class FiveBarElbow:
                 if self.limit_z[0] > self.limit_z[1]:
                     raise homing.EndstopMoveError(
                         end_pos, "Must home axis first")
-                raise homing.EndstopMoveError(end_pos)
+                raise move.move_error("Z out of range")
             # Move with Z - update velocity and accel for slower Z axis
             z_ratio = move.move_d / abs(move.axes_d[2])
             move.limit_speed(
                 self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio)
 
     def get_status(self, eventtime):
-        xy_home = "" # TODO
+        xy_home = "xy" if self.homedXY else ""
         z_home = "z" if self.limit_z[0] <= self.limit_z[1] else ""
         return {'homed_axes': xy_home + z_home}
 
