@@ -226,7 +226,7 @@ class FiveBarElbow:
 
             # Check elbow angle limits
             [left_a, right_a, left_d, right_d] = self._position_to_angles(xpos, ypos)
-            logging.info("check XY %.8f, %.8f  LR a %.8f, %.8f  LR d %.2f, %.2f   ", xpos, ypos, left_a, right_a, left_d, right_d)
+            #logging.info("check XY %.8f, %.8f  LR a %.8f, %.8f  LR d %.2f, %.2f   ", xpos, ypos, left_a, right_a, left_d, right_d)
             left_min_a, left_max_a = self.rails[0].get_range()
             if left_a < left_min_a or left_a > left_max_a:
                 logging.info("left failed check %.12f < %.12f < %.12f    ", left_min_a, left_a, left_max_a)
